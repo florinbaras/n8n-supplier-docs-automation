@@ -1,0 +1,858 @@
+{
+  "name": "Supplier document reader → ERP import (demo)",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Upload order confirmations and delivery notes",
+        "formDescription": "Upload one or more documents (PDF or Excel)",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Documents",
+              "fieldType": "file",
+              "acceptFileTypes": ".pdf, .xls, .xlsx",
+              "requiredField": true
+            }
+          ]
+        },
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        48,
+        528
+      ],
+      "id": "c564136a-b820-4136-a6dc-4aee2b481365",
+      "name": "Upload form",
+      "webhookId": "baaa0db4-4472-4b02-8ccb-315de8a3459c"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// RULEBOOK – everything we know about each supplier.\n// To add a supplier or change a rule, edit ONLY this node.\n// FICTIONAL DEMO DATA (suppliers LUBRIKA / MAZOL / FILTRONIQ, customer VELOX).\n// v3: long PDFs are read page by page + codePattern for the completeness check.\n// ============================================================\n\nconst rulebook = {\n\n  // Which OpenAI model reads the PDFs\n  ai: {\n    model: \"gpt-6-luna\",       // digital PDFs (text)\n    modelScan: \"gpt-6-luna\",   // scans – switch to \"gpt-6.1-sol\" if scans are misread\n    splitAbovePages: 4,        // PDFs longer than this are read one page at a time\n    reviewScans: true,         // scans can't be checked against text -> always \"Needs review\"\n  },\n\n  // Same document uploaded as PDF and as Excel? Use only the Excel.\n  preferExcelOverPdf: true,\n\n  suppliers: {\n\n    lubrika: {\n      name: \"LUBRIKA\",\n      identify: [\"LUBRIKA\"],\n      docType: {\n        OC: [\"Auftragsbestätigung\"],\n        DN: [\"Lieferschein\"],\n      },\n      rules: {\n        multiplyByPackSize: { OC: true, DN: false }, // boxes -> pieces on OC only\n        litreLinesUnit: \"L\",                          // lines priced per litre (pos. 110)\n        defaultUnit: \"STK\",                           // everything else is pieces\n        stripLeadingZeros: true,                      // 0402370955 -> 402370955\n      },\n      // What a product code looks like in the text (used to check nothing was skipped)\n      codePattern: \"\\\\b4[0-4]\\\\d{4}\\\\b\",                  // 410112, 420022 ...\n      // What the AI must know about this supplier's documents\n      aiNotes: `\n- Order confirmation = \"Auftragsbestätigung\". Delivery note = \"Lieferschein\".\n- Order confirmation: documentNumber = \"Belegnummer\"; poNumber = \"Bestellnummer\".\n- Every position starts with the position number (\"Posten\": 10, 20, 30...) and the material number = supplierPartNo.\n  \"Materialnummer des Kunden\" = customerPartNo.\n- \"Einheit\" is the package (Karton, Bag in Box) -> unit.\n- \"Menge\" is the NUMBER OF PACKAGES, not pieces -> quantity (e.g. \"2,00\").\n- \"Inhalt\" is what one package contains -> packSize = only the count of pieces or litres:\n  \"10 X 1 l\" -> \"10\", \"4X4l\" -> \"4\", \"3X5l\" -> \"3\", \"20 l\" -> \"20\".\n- \"Preis\" -> unitPrice (e.g. \"7,19\") and priceUnit = the word after \"pro\" (\"Stk\" or \"l\").\n- \"Betrag EUR\" -> lineTotal. Each position has its own \"Lieferdatum\" -> deliveryDate of that line.\n- A position can continue on the next page: it is still ONE line.\n- Delivery note: documentNumber = \"Lieferscheinnummer\" (keep leading zeros exactly as printed);\n  poNumber = \"Ihre Bestellung\" or \"Kundenbestellnr\"; deliveryDate = \"Lieferdatum\";\n  per line: supplierPartNo = \"Material\" or \"Artikel\"; quantity = number in \"Menge\" (\"1 KAR\" -> \"1\");\n  unit = the package word (\"Karton\" / \"KAR\"); packSize from \"Inhalt\" (\"10 CU\" -> \"10\").`,\n    },\n\n    mazol: {\n      name: \"MAZOL\",\n      // Careful: the OC never prints \"MAZOL\", only \"Detail objednávky\"\n      identify: [\"MAZOL\", \"Detail objednávky\"],\n      docType: {\n        OC: [\"Detail objednávky\"],\n        DN: [\"Dodací list\"],\n      },\n      rules: {\n        positionNumbering: \"10-20-30\",                // no positions printed\n        priceWithVat: false,                          // use the price without VAT\n        unitMap: { ks: \"STK\" },\n      },\n      codePattern: \"\\\\b7\\\\d{4}\\\\b\",                       // 70112, 70822 ...\n      aiNotes: `\n- Order confirmation = \"Detail objednávky\" (the supplier name is NOT printed on it). Delivery note = \"Dodací list\".\n- Order confirmation: documentNumber = the number after \"Detail objednávky č.\"; poNumber = the \"PO...\" number\n  inside \"Poznámka od zákazníka\". There are no position numbers: position = null.\n- supplierPartNo = \"Kód\". unit = \"ks\".\n- \"Dodáno / Objednáno\" = delivered / ordered: \"0ks / 4ks\" -> confirmedQuantity \"0\", quantity \"4\".\n- unitPrice = \"Cena / (m. j.) bez DPH\" (WITHOUT VAT). lineTotal = null (\"Celkem\" includes VAT).\n- No delivery dates are printed: deliveryDate = null.\n- Delivery note: documentNumber = number after \"Dodací list č.\"; poNumber = number after \"Objednávka č.\";\n  supplierPartNo = the number at the start of \"Označení dodávky\"; quantity from \"Množství\" (\"4 ks\" -> \"4\"), unit \"ks\".\n  \"Vystaveno\" is the issue date, NOT a delivery date: deliveryDate = null.`,\n    },\n\n    filtroniq: {\n      name: \"FILTRONIQ\",\n      identify: [\"FILTRONIQ\"],\n      docType: {\n        OC: [\"Proforma Invoice\", \"Unit price\"],\n        DN: [\"Invoice specification\", \"Packing list\"],\n      },\n      rules: {\n        stripPoSuffix: true,                          // \"PO8800000734 QWP\" -> \"PO8800000734\"\n        productCode: \"customerPartNo\",                // CF125 / FK 1107 (not the FQ index)\n        mergeSameSkuAcrossPallets: false,             // one row per pallet\n        unitMap: { SZ: \"STK\", pcs: \"STK\" },\n      },\n      codePattern: \"\\\\b(?:[CAO]F\\\\d{3}|F[PK] \\\\d{3,4}[A-Z0-9/-]*)\",  // CF125, FK 1119A-2X, FP 002/2\n      aiNotes: `\n- Order confirmation = \"Proforma Invoice for order ...\". Delivery note = \"Invoice specification\".\n- Order confirmation: documentNumber = the number after \"Proforma Invoice for order\"; poNumber = after\n  \"Customer Order Number\"; position = \"No\"; customerPartNo = \"Part No\"; unit = \"Unit\";\n  unitPrice = \"Discount Unit Price\"; lineTotal = \"Total Amount\".\n- Delivery note: one line per row; palletNo = \"Pallet No\"; customerPartNo = \"Customer Part No\";\n  poNumber of the LINE = \"Reference\". The reference is often split over two text lines\n  (\"PO88000006\" then \"61\") – join them into one (\"PO8800000661\").`,\n      // How their Excel files are laid out.\n      // Column titles must be written exactly as in the file.\n      excel: {\n        OC: {\n          docNumberLabel: \"Invoice no:\",\n          columns: {\n            position: \"No.\",\n            customerPartNo: \"Part No/Indeks Klienta\",\n            supplierPartNo: \"Part no/Indeks\",\n            quantity: \"Qty/Ilość\",\n            unit: \"Unit/JM\",\n            unitPrice: \"Discount price/Cena po rabacie\",\n            lineTotal: \"Value Net/Wartość netto\",\n            poNumber: \"Customer order no/Nr zamówienia klienta\",\n          },\n        },\n        DN: {\n          docNumberLabel: \"Packing list for the invoice no:\",\n          columns: {\n            palletNo: \"Pallet no\",\n            customerPartNo: \"Customer Part No\",\n            supplierPartNo: \"FILTRONIQ part no\",\n            quantity: \"Quantity\",\n            unit: \"UM\",\n            poNumber: \"Reference\",\n          },\n        },\n      },\n    },\n  },\n\n  // How the output Excel must look\n  output: {\n    dateFormat: \"YYYY-MM-DD\",\n    decimalSeparator: \",\",\n    // Column order exactly as in the templates\n    columns: {\n      OC: [\n        \"DOCUMENTNUMBER\", \"BUYERREFERENCE\", \"POSITIONNUMBER\",\n        \"CONFIRMEDPRODUCTIDEXTERNAL\", \"REJECTED\", \"SUBSTITUTEPRODUCTIDEXTERNAL\",\n        \"CONFIRMEDDLVDATE\", \"CONFIRMEDQUANTITY\", \"CONFIRMEDQUANTITYUOM\",\n        \"PRICE\", \"COSTPRICE\", \"INFODATE\", \"QUANTITY\", \"DOCUMENTTYPE\",\n      ],\n      DN: [\n        \"PACKINGSLIPID\", \"ESTIMATEDARRIVALDATETIME\", \"LICENSEPLATENUMBER\",\n        \"PURCHASEORDERNUMBER\", \"EXTERNALITEMID\", \"QUANTITY\", \"UNITSYMBOL\",\n      ],\n    },\n  },\n};\n\n// Pass the uploaded files through untouched, and attach the rulebook.\nreturn [\n  {\n    json: { rulebook },\n    binary: $input.first().binary,\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        272,
+        528
+      ],
+      "id": "9d336cfe-7680-4faf-823f-9181a92ea659",
+      "name": "RULEBOOK",
+      "notesInFlow": true,
+      "notes": "All supplier rules – the only place to edit"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// SPLIT FILES – turns \"one item with many files\" into \"one item per file\".\n// v2: a PDF that also exists as Excel (same name) is marked \"duplicate\"\n//     and is not sent to the AI – the Excel is read exactly, at no cost.\n// ============================================================\n\nconst rulebook = $('RULEBOOK').first().json.rulebook;\n\n// All uploaded files, as they arrive: Documents_0, Documents_1, ...\nconst files = $input.first().binary;\n\n// The empty list we'll fill with one item per file\nconst output = [];\n\n// Go through the files one by one\nfor (const key of Object.keys(files)) {\n  const file = files[key];\n\n  // File extension in lowercase (LUBRIKA sends \".PDF\" in capitals)\n  const ext = (file.fileExtension || \"\").toLowerCase();\n\n  // Label the file by its extension\n  let fileKind = \"unknown\";\n  if (ext === \"pdf\") fileKind = \"pdf\";\n  if (ext === \"xls\" || ext === \"xlsx\") fileKind = \"excel\";\n\n  // Add one item for this file\n  output.push({\n    json: {\n      fileName: file.fileName,\n      fileKind: fileKind,\n    },\n    binary: {\n      data: file, // every file now travels under the same name: \"data\"\n    },\n  });\n}\n\n// A PDF with an Excel twin (same name, other extension) -> \"duplicate\"\nif (rulebook.preferExcelOverPdf) {\n  const baseName = name => name.replace(/\\.[^.]+$/, \"\").toLowerCase();\n  const excelNames = output\n    .filter(item => item.json.fileKind === \"excel\")\n    .map(item => baseName(item.json.fileName));\n  for (const item of output) {\n    if (item.json.fileKind === \"pdf\" && excelNames.includes(baseName(item.json.fileName))) {\n      item.json.fileKind = \"duplicate\";\n    }\n  }\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        496,
+        528
+      ],
+      "id": "5adbfc4d-3d6b-4d16-bdc2-eafe6f810db7",
+      "name": "Split files"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.fileKind }}",
+                    "rightValue": "pdf",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "a00fb0a7-38a1-402f-812b-cc8f6770c117"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "pdf"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "19f72095-0f17-4ef2-bd11-6800c5551960",
+                    "leftValue": "={{ $json.fileKind }}",
+                    "rightValue": "excel",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "excel"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        768,
+        512
+      ],
+      "id": "e63cf30c-618a-4438-968f-e553347498df",
+      "name": "File type?"
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "options": {
+          "joinPages": false,
+          "keepSource": "both"
+        }
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        160
+      ],
+      "id": "d74b5eae-14f1-4112-812e-57885501ecd6",
+      "name": "Extract PDF text"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ============================================================\n// DIGITAL OR SCANNED? – v2: the text arrives page by page (\"Join Pages\" off).\n// Counts the characters; a scan is only a picture, so ~0 characters.\n// ============================================================\n\n// With \"Join Pages\" off, n8n gives a list: one text per page\nconst pages = Array.isArray($json.text) ? $json.text.map(t => String(t || \"\")) : [String($json.text || \"\")];\nconst text = pages.join(\"\\n\\n\");\n\n// Remove spaces and line breaks, count only real characters\nconst charCount = text.replace(/\\s/g, \"\").length;\n\n// Under 100 real characters = no usable text layer, so it is a scan\nconst pdfType = charCount > 100 ? \"digital\" : \"scanned\";\n\nreturn {\n  json: {\n    fileName: $('Split files').item.json.fileName,\n    pdfType: pdfType,\n    charCount: charCount,\n    pageCount: $json.numpages || pages.length,\n    pages: pages,      // the text of each page, separately\n    text: text,        // all pages together\n  },\n  binary: $('Split files').item.binary,\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1184,
+        160
+      ],
+      "id": "cf18c458-c158-4371-904a-d8ce5d2c56c0",
+      "name": "Digital or scanned"
+    },
+    {
+      "parameters": {
+        "operation": "xls",
+        "options": {
+          "headerRow": false,
+          "includeEmptyCells": true
+        }
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        1056,
+        528
+      ],
+      "id": "cd17fbb8-7c02-4dc8-8f90-5512c3d3da2b",
+      "name": "Extract Excel"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// READ EXCEL – turn supplier Excel rows into standard lines.\n// Reads the layout from RULEBOOK, so new Excel suppliers need no new code.\n// ============================================================\n\nconst rulebook = $('RULEBOOK').first().json.rulebook;\nconst items = $input.all();\n\n// ---------- Helpers ----------\n\n// One Excel row -> a simple list of cells\nfunction toCells(json) {\n  const values = Object.values(json);\n  if (values.length === 1 && Array.isArray(values[0])) return values[0];\n  return values;\n}\n\n// A cell as lowercase text without spaces at the ends (for comparing)\nfunction clean(value) {\n  return String(value ?? \"\").trim().toLowerCase();\n}\n\n// Which supplier? Looks for the RULEBOOK \"identify\" words\nfunction findSupplier(text) {\n  for (const [key, s] of Object.entries(rulebook.suppliers)) {\n    if (s.identify.some(word => text.includes(word.toLowerCase()))) return key;\n  }\n  return null;\n}\n\n// OC or DN? Looks for the RULEBOOK \"docType\" words\nfunction findDocType(text, supplier) {\n  for (const [type, words] of Object.entries(supplier.docType)) {\n    if (words.some(word => text.includes(word.toLowerCase()))) return type;\n  }\n  return null;\n}\n\n// ---------- 1. Group the rows by the file they came from ----------\nconst files = {};\nitems.forEach((item, i) => {\n  const fileName = $('Split files').itemMatching(i).json.fileName;\n  if (!files[fileName]) files[fileName] = [];\n  files[fileName].push(toCells(item.json));\n});\n\n// ---------- 2. Read each file ----------\nconst output = [];\n\nfor (const [fileName, rows] of Object.entries(files)) {\n  const allText = rows.map(r => r.join(\" \")).join(\" \").toLowerCase();\n\n  // Supplier\n  const supplierKey = findSupplier(allText);\n  if (!supplierKey) {\n    output.push({ json: { sourceFile: fileName, status: \"Unknown supplier\" } });\n    continue;\n  }\n  const supplier = rulebook.suppliers[supplierKey];\n\n  // Document type + its Excel layout from RULEBOOK\n  const docType = findDocType(allText, supplier);\n  const layout = supplier.excel?.[docType];\n  if (!layout) {\n    output.push({ json: { sourceFile: fileName, supplierName: supplier.name,\n                          status: \"Unknown document type in Excel\" } });\n    continue;\n  }\n\n  // Document number: the first filled cell after its label\n  let documentNumber = null;\n  for (const row of rows) {\n    const idx = row.findIndex(c => clean(c) === clean(layout.docNumberLabel));\n    if (idx >= 0) {\n      documentNumber = row.slice(idx + 1).find(c => clean(c) !== \"\") ?? null;\n      break;\n    }\n  }\n\n  // Header row: the row that contains the PO column title\n  const headerIndex = rows.findIndex(row =>\n    row.some(c => clean(c) === clean(layout.columns.poNumber)));\n  if (headerIndex < 0) {\n    output.push({ json: { sourceFile: fileName, supplierName: supplier.name,\n                          status: \"Table header not found\" } });\n    continue;\n  }\n  const header = rows[headerIndex].map(clean);\n\n  // Which column number each field sits in\n  const col = {};\n  for (const [field, title] of Object.entries(layout.columns)) {\n    col[field] = header.indexOf(clean(title));\n  }\n  const get = (row, field) => (col[field] >= 0 ? row[col[field]] : null);\n\n  // The lines under the header\n  for (const row of rows.slice(headerIndex + 1)) {\n    const code = get(row, \"customerPartNo\") || get(row, \"supplierPartNo\");\n    const quantity = get(row, \"quantity\");\n    if (clean(code) === \"\" || isNaN(parseFloat(quantity))) continue; // empty or total row\n\n    output.push({\n      json: {\n        sourceFile: fileName,\n        supplier: supplierKey,\n        supplierName: supplier.name,\n        docType: docType,\n        documentNumber: documentNumber != null ? String(documentNumber) : null,\n        poNumber: get(row, \"poNumber\"),\n        position: get(row, \"position\"),\n        customerPartNo: get(row, \"customerPartNo\"),\n        supplierPartNo: get(row, \"supplierPartNo\"),\n        quantity: quantity,\n        unit: get(row, \"unit\"),\n        unitPrice: get(row, \"unitPrice\"),\n        lineTotal: get(row, \"lineTotal\"),\n        palletNo: get(row, \"palletNo\"),\n        status: \"OK\",\n      },\n    });\n  }\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1472,
+        528
+      ],
+      "id": "dcebb866-807a-49a1-97c3-650890b5a913",
+      "name": "Read Excel"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// APPLY RULES – RULEBOOK rules + checks, line by line.\n// v2: litre lines, defaultUnit, printed confirmed quantity (for the PDF road).\n// v3: also passes on the notes of the AI completeness check (checkNote).\n// In:  standard lines (from any road: Excel, PDF, scan)\n// Out: per line -> the template row + a review note\n// ============================================================\n\nconst rulebook = $('RULEBOOK').first().json.rulebook;\nconst dec = rulebook.output.decimalSeparator;\n\n// ---------- Helpers ----------\n\n// Read a number from anything: 60, \"60.0\", \"2,00\", \"1.183,73\", \"2 463,76\"\nfunction toNumber(value) {\n  if (value === null || value === undefined || value === \"\") return null;\n  if (typeof value === \"number\") return value;\n  let s = String(value).replace(/\\s/g, \"\");\n  if (s.includes(\",\")) s = s.replace(/\\./g, \"\").replace(\",\", \".\");\n  const n = parseFloat(s);\n  return isNaN(n) ? null : n;\n}\n\n// Write a number the way the template wants it: 7.19 -> \"7,19\", 60 -> \"60\"\nfunction formatNumber(n) {\n  if (n === null || n === undefined) return \"\";\n  return String(parseFloat(n.toFixed(4))).replace(\".\", dec);\n}\n\n// \"15.10.2026\" -> \"2026-10-15\"; \"2026-10-15\" stays as it is\nfunction toIsoDate(value) {\n  if (!value) return \"\";\n  const s = String(value).trim();\n  const m = s.match(/^(\\d{1,2})\\.(\\d{1,2})\\.(\\d{4})$/);\n  if (m) return `${m[3]}-${m[2].padStart(2, \"0\")}-${m[1].padStart(2, \"0\")}`;\n  return s;\n}\n\n// ---------- Apply the rules ----------\nconst output = [];\nconst positionCounter = {}; // for suppliers that print no position numbers\n\nfor (const item of $input.all()) {\n  const line = item.json;\n\n  // Files we couldn't read: they only go to the review sheet\n  if (line.status !== \"OK\") {\n    output.push({ json: { template: null, row: null, review: {\n      sourceFile: line.sourceFile, supplier: line.supplierName || \"\",\n      docType: \"\", documentNumber: \"\", position: \"\", productCode: \"\",\n      status: \"Needs review\", reason: line.status } } });\n    continue;\n  }\n\n  const rules = rulebook.suppliers[line.supplier].rules || {};\n  const notes = []; // reasons this line needs a human look\n  if (line.checkNote) notes.push(line.checkNote); // from the AI checks (missing/invented code, scan)\n\n  // Document number – remove leading zeros if the rule says so\n  let documentNumber = String(line.documentNumber ?? \"\").trim();\n  if (rules.stripLeadingZeros) documentNumber = documentNumber.replace(/^0+/, \"\");\n\n  // PO number – cut suffixes like \" QWP\" if the rule says so\n  let poNumber = String(line.poNumber ?? \"\").trim();\n  if (rules.stripPoSuffix) poNumber = poNumber.split(/\\s+/)[0];\n\n  // Product code – the one RULEBOOK says to use\n  const productCode = String(line[rules.productCode || \"supplierPartNo\"] ?? \"\").trim();\n\n  // Unit – in this order:\n  //  1. line priced per litre + rule litreLinesUnit -> \"L\"\n  //  2. unitMap translation (SZ -> STK, ks -> STK), ignoring capitals\n  //  3. the supplier's defaultUnit (LUBRIKA: Karton -> STK)\n  //  4. otherwise the printed unit in capitals\n  const rawUnit = String(line.unit ?? \"\").trim();\n  const perLitre = /^(l|liter|litre|ltr)$/i.test(String(line.priceUnit ?? \"\").trim());\n  const mapKey = Object.keys(rules.unitMap || {})\n    .find(k => k.toLowerCase() === rawUnit.toLowerCase());\n  let unit;\n  if (perLitre && rules.litreLinesUnit) unit = rules.litreLinesUnit;\n  else if (mapKey) unit = rules.unitMap[mapKey];\n  else if (rules.defaultUnit) unit = rules.defaultUnit;\n  else unit = rawUnit.toUpperCase();\n\n  // Quantity – as printed, and converted (boxes -> pieces) if the rule says so\n  const printedQty = toNumber(line.quantity);\n  const packSize = toNumber(line.packSize);\n  let confirmedQty = printedQty;\n  if (rules.multiplyByPackSize?.[line.docType] && packSize && printedQty !== null) {\n    confirmedQty = printedQty * packSize;\n  }\n  // The document prints a confirmed quantity of its own (MAZOL \"0ks / 4ks\")? That one wins.\n  const printedConfirmed = toNumber(line.confirmedQuantity);\n  if (printedConfirmed !== null) confirmedQty = printedConfirmed;\n\n  // Position – as printed, or numbered 10-20-30 when the supplier prints none\n  let position = line.position;\n  if (position === null || position === undefined || position === \"\") {\n    positionCounter[line.sourceFile] = (positionCounter[line.sourceFile] || 0) + 1;\n    const n = positionCounter[line.sourceFile];\n    position = rules.positionNumbering === \"10-20-30\" ? n * 10 : n;\n  }\n  position = formatNumber(toNumber(position));\n\n  const unitPrice = toNumber(line.unitPrice);\n  const lineTotal = toNumber(line.lineTotal);\n\n  // ---------- Checks ----------\n  if (!documentNumber) notes.push(\"Document number missing\");\n  if (!productCode) notes.push(\"Product code missing\");\n  if (confirmedQty === null) notes.push(\"Quantity missing\");\n  if (line.docType === \"OC\" && unitPrice !== null && lineTotal !== null && confirmedQty !== null) {\n    const expected = confirmedQty * unitPrice;\n    if (Math.abs(expected - lineTotal) > 0.02) {\n      notes.push(`Quantity x price = ${formatNumber(expected)}, but the line total is ${formatNumber(lineTotal)}`);\n    }\n  }\n\n  // ---------- The template row, with the template's exact column names ----------\n  let row;\n  if (line.docType === \"OC\") {\n    row = {\n      DOCUMENTNUMBER: documentNumber,\n      BUYERREFERENCE: poNumber,\n      POSITIONNUMBER: position,\n      CONFIRMEDPRODUCTIDEXTERNAL: productCode,\n      REJECTED: \"\",\n      SUBSTITUTEPRODUCTIDEXTERNAL: \"\",\n      CONFIRMEDDLVDATE: toIsoDate(line.deliveryDate),\n      CONFIRMEDQUANTITY: formatNumber(confirmedQty),\n      CONFIRMEDQUANTITYUOM: unit,\n      PRICE: formatNumber(unitPrice),\n      COSTPRICE: \"\",\n      INFODATE: \"\",\n      QUANTITY: formatNumber(printedQty),\n      DOCUMENTTYPE: \"OrderResponse\",\n    };\n  } else {\n    row = {\n      PACKINGSLIPID: documentNumber,\n      ESTIMATEDARRIVALDATETIME: toIsoDate(line.deliveryDate),\n      LICENSEPLATENUMBER: line.licensePlate || \"\",\n      PURCHASEORDERNUMBER: poNumber,\n      EXTERNALITEMID: productCode,\n      QUANTITY: formatNumber(confirmedQty),\n      UNITSYMBOL: unit,\n    };\n  }\n\n  output.push({\n    json: {\n      template: line.docType,\n      row: row,\n      review: {\n        sourceFile: line.sourceFile,\n        supplier: line.supplierName,\n        docType: line.docType,\n        documentNumber: documentNumber,\n        position: position,\n        productCode: productCode,\n        status: notes.length ? \"Needs review\" : \"OK\",\n        reason: notes.join(\"; \"),\n      },\n    },\n  });\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2192,
+        528
+      ],
+      "id": "6e576e4b-d248-4f67-9480-238e8b2e4e85",
+      "name": "Apply rules"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// TEMPLATE ROWS – keep one document type, only the template columns,\n// in the template's order.\n// ============================================================\n\nconst TYPE = \"OC\"; // <- in the DN copy of this node, write \"DN\"\n\nconst columns = $('RULEBOOK').first().json.rulebook.output.columns[TYPE];\n\nconst rows = $input.all()\n  .filter(item => item.json.template === TYPE)\n  .map(item => {\n    const ordered = {};\n    for (const c of columns) ordered[c] = item.json.row[c] ?? \"\";\n    return { json: ordered };\n  });\n\n// None of this type in the upload? One empty row, so the file still gets made\nif (rows.length === 0) {\n  const empty = {};\n  for (const c of columns) empty[c] = \"\";\n  return [{ json: empty }];\n}\n\nreturn rows;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2704,
+        736
+      ],
+      "id": "0587ece9-6e18-41b0-8b99-06d6697fc9cb",
+      "name": "OC rows"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// TEMPLATE ROWS – keep one document type, only the template columns,\n// in the template's order.\n// ============================================================\n\nconst TYPE = \"DN\"; \n\nconst columns = $('RULEBOOK').first().json.rulebook.output.columns[TYPE];\n\nconst rows = $input.all()\n  .filter(item => item.json.template === TYPE)\n  .map(item => {\n    const ordered = {};\n    for (const c of columns) ordered[c] = item.json.row[c] ?? \"\";\n    return { json: ordered };\n  });\n\n// None of this type in the upload? One empty row, so the file still gets made\nif (rows.length === 0) {\n  const empty = {};\n  for (const c of columns) empty[c] = \"\";\n  return [{ json: empty }];\n}\n\nreturn rows;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2704,
+        528
+      ],
+      "id": "a2e7129a-0e6e-4306-b779-11104a875000",
+      "name": "DN rows"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// REVIEW ROWS – the review file.\n// Only the lines that need a human look, with the reason.\n// ============================================================\n\nconst rows = $input.all().map(item => {\n  const r = item.json.review;\n  return {\n    json: {\n      \"Status\": r.status,\n      \"Reason\": r.reason,\n      \"Source file\": r.sourceFile,\n      \"Supplier\": r.supplier,\n      \"Document type\": r.docType,\n      \"Document no.\": r.documentNumber,\n      \"Position\": r.position,\n      \"Product code\": r.productCode,\n    },\n  };\n});\n\n// Keep only the lines that need a human look\nconst toCheck = rows.filter(r => r.json.Status !== \"OK\");\n\n// Nothing to check? One row that says so, so the file isn't empty\nif (toCheck.length === 0) {\n  return [{ json: { \"Status\": \"OK\", \"Reason\": \"All lines are OK\" } }];\n}\n\nreturn toCheck;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2704,
+        352
+      ],
+      "id": "6d70c076-c663-499b-b458-89969407dad7",
+      "name": "Review rows"
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        3200,
+        512
+      ],
+      "id": "9a16bab6-b897-4d42-8ce6-7ac5cd541d37",
+      "name": "Collect files"
+    },
+    {
+      "parameters": {
+        "operation": "compress",
+        "binaryPropertyName": "file_0,file_1,file_2",
+        "fileName": "Result.zip"
+      },
+      "type": "n8n-nodes-base.compression",
+      "typeVersion": 1.1,
+      "position": [
+        3648,
+        528
+      ],
+      "id": "8323d6f1-5abe-46db-be92-32d3d3826805",
+      "name": "Zip"
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "returnBinary",
+        "completionTitle": "Your result is ready",
+        "completionMessage": "Result.zip downloads automatically. Check Review.xlsx first.",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        3872,
+        528
+      ],
+      "id": "c18b50d4-bb9f-4134-9b83-52a2f6fc91ad",
+      "name": "Download result",
+      "webhookId": "bd6a107f-4fb2-47c8-aca6-52b5d2e27ae5"
+    },
+    {
+      "parameters": {
+        "operation": "xlsx",
+        "options": {
+          "fileName": "Review.xlsx",
+          "sheetName": "Review"
+        }
+      },
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        2928,
+        352
+      ],
+      "id": "d136d3ee-9f32-458d-b3bf-15dc86ebca96",
+      "name": "Review file"
+    },
+    {
+      "parameters": {
+        "operation": "xlsx",
+        "options": {
+          "fileName": "DN.xlsx",
+          "sheetName": "Sheet1"
+        }
+      },
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        2928,
+        528
+      ],
+      "id": "23ca6057-8cda-4d34-b3eb-653a77188a2d",
+      "name": "DN file"
+    },
+    {
+      "parameters": {
+        "operation": "xlsx",
+        "options": {
+          "fileName": "OC.xlsx",
+          "sheetName": "Sheet1"
+        }
+      },
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        2928,
+        736
+      ],
+      "id": "37b0825d-95b8-44d0-bb58-105f87295d87",
+      "name": "OC file"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// BUNDLE FILES – the 3 files from 3 items -> into 1 item,\n// because the Zip node packs files that sit in the same item.\n// ============================================================\n\nconst binary = {};\n$input.all().forEach((item, i) => {\n  binary[`file_${i}`] = item.binary.data;\n});\n\nreturn [{ json: {}, binary }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3424,
+        528
+      ],
+      "id": "9353f8c8-6e45-4a8d-9564-787047c000b8",
+      "name": "Bundle files"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// BUILD AI REQUEST – v2. Builds the questions for OpenAI.\n//  - short digital PDF  -> 1 question with all its text\n//  - long digital PDF   -> 1 question PER PAGE (more than RULEBOOK ai.splitAbovePages)\n//  - scan               -> 1 question with the PDF file itself\n// The AI only COPIES what is printed; the rules in RULEBOOK do the maths later.\n// MODE: Run Once for All Items\n// ============================================================\n\nconst rulebook = $('RULEBOOK').first().json.rulebook;\nconst items = $input.all();\nconst output = [];\n\n// ---------- The fixed answer format (OpenAI must follow it exactly) ----------\nconst str = { type: [\"string\", \"null\"] };\nconst lineFields = {\n  position: str, supplierPartNo: str, customerPartNo: str, description: str,\n  poNumber: str, quantity: str, confirmedQuantity: str, unit: str, packSize: str,\n  unitPrice: str, priceUnit: str, lineTotal: str, deliveryDate: str, palletNo: str,\n};\nconst schema = {\n  type: \"object\",\n  additionalProperties: false,\n  required: [\"supplier\", \"docType\", \"documentNumber\", \"poNumber\", \"deliveryDate\", \"lines\"],\n  properties: {\n    supplier: { type: \"string\", enum: [...Object.keys(rulebook.suppliers), \"unknown\"] },\n    docType: { type: \"string\", enum: [\"OC\", \"DN\", \"unknown\"] },\n    documentNumber: str,\n    poNumber: str,\n    deliveryDate: str,\n    lines: {\n      type: \"array\",\n      items: { type: \"object\", additionalProperties: false, required: Object.keys(lineFields), properties: lineFields },\n    },\n  },\n};\n\n// ---------- The instructions, with the notes of the supplier(s) ----------\nfunction instructionsFor(keys) {\n  const notes = keys\n    .map(k => `### Supplier \"${k}\" (${rulebook.suppliers[k].name})${rulebook.suppliers[k].aiNotes || \"\"}`)\n    .join(\"\\n\\n\");\n  return `You read order confirmations (OC) and delivery notes (DN) sent by suppliers\nto a car-parts distributor, and you copy their content into a fixed JSON format.\n\nRULES\n1. Copy values EXACTLY as printed. Do not calculate, convert or round anything.\n   Numbers stay as printed text, with their own decimal comma (\"7,19\", \"2,00\", \"2 463,76\").\n   Dates stay as printed (\"15.10.2026\").\n2. One entry in \"lines\" for EVERY product line you are given, in the order printed. Do not stop early.\n   A line that continues on the next page is still one line. Skip totals, VAT and note rows.\n3. If a value is not printed, use null. Never invent a value.\n4. \"supplier\" must be one of the supplier keys below; if none fits, use \"unknown\".\n5. \"docType\": \"OC\" for an order confirmation, \"DN\" for a delivery note, \"unknown\" otherwise.\n6. Put a value on the line (\"poNumber\", \"deliveryDate\") only when it is printed on that line;\n   values printed once for the whole document go in the document-level fields.\n\nSUPPLIER NOTES\n${notes}`;\n}\n\n// ---------- One request ----------\nfunction request({ fileName, supplierKey, isScan, part, parts, pageText, content, keys }) {\n  return {\n    fileName, supplierKey, isScan, part, parts,\n    pageText,   // the text this request covers – used later to check nothing was skipped\n    body: {\n      model: isScan ? rulebook.ai.modelScan : rulebook.ai.model,\n      instructions: instructionsFor(keys),\n      input: [{ role: \"user\", content }],\n      text: { format: { type: \"json_schema\", name: \"supplier_document\", strict: true, schema } },\n    },\n  };\n}\n\n// ---------- Go through the PDFs ----------\nfor (let index = 0; index < items.length; index++) {\n  const doc = items[index].json;\n  const fileName = doc.fileName;\n  const isScan = doc.pdfType === \"scanned\";\n  const pages = doc.pages || [doc.text || \"\"];\n  const lower = (doc.text || \"\").toLowerCase();\n\n  // Which supplier? (only possible when there is text)\n  let supplierKey = null;\n  for (const [key, s] of Object.entries(rulebook.suppliers)) {\n    if (s.identify.some(word => lower.includes(word.toLowerCase()))) { supplierKey = key; break; }\n  }\n  const keys = supplierKey ? [supplierKey] : Object.keys(rulebook.suppliers);\n\n  if (isScan) {\n    // Scan: send the PDF file itself\n    const buffer = await this.helpers.getBinaryDataBuffer(index, \"data\");\n    output.push({\n      json: request({\n        fileName, supplierKey, isScan, part: 1, parts: 1, pageText: \"\", keys,\n        content: [\n          { type: \"input_file\", filename: fileName, file_data: `data:application/pdf;base64,${buffer.toString(\"base64\")}` },\n          { type: \"input_text\", text: \"Copy this document into the JSON format.\" },\n        ],\n      }),\n      pairedItem: { item: index },\n    });\n  } else if (pages.length > (rulebook.ai.splitAbovePages || 999)) {\n    // Long document: one request per page\n    pages.forEach((pageText, p) => {\n      output.push({\n        json: request({\n          fileName, supplierKey, isScan, part: p + 1, parts: pages.length, pageText, keys,\n          content: [\n            { type: \"input_text\", text: `DOCUMENT TEXT (${fileName}) – PAGE ${p + 1} OF ${pages.length}:\\n\\n${pageText}` },\n            { type: \"input_text\", text: `Copy ONLY the product lines printed on this page. Document-level fields: fill them only if they are printed on this page, otherwise null.` },\n          ],\n        }),\n        pairedItem: { item: index },\n      });\n    });\n  } else {\n    // Short document: one request with all its text\n    output.push({\n      json: request({\n        fileName, supplierKey, isScan, part: 1, parts: 1, pageText: doc.text, keys,\n        content: [\n          { type: \"input_text\", text: `DOCUMENT TEXT (${fileName}):\\n\\n${doc.text}` },\n          { type: \"input_text\", text: \"Copy this document into the JSON format.\" },\n        ],\n      }),\n      pairedItem: { item: index },\n    });\n  }\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1408,
+        160
+      ],
+      "id": "aacfcf70-58ea-4786-8ca1-b745f7050b31",
+      "name": "Build AI request",
+      "notesInFlow": true,
+      "notes": "Long PDF → one request per page"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/responses",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=     {{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1616,
+        160
+      ],
+      "id": "f4820d43-7d6a-400d-9959-4bdf88da057b",
+      "name": "Ask OpenAI",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "openAiApi": {
+          "id": "KToUezoRhDMvgFZP",
+          "name": "OpenAI Cont Personal"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// READ AI ANSWER – v2\n//  1. glues the pages of one document back together\n//  2. checks, in code, that NO product line was skipped or invented:\n//     every product code found in the page text must be in the AI's answer, and\n//     every code in the AI's answer must be in the page text (RULEBOOK codePattern)\n//  3. turns everything into standard lines (same shape as \"Read Excel\")\n// ============================================================\n\nconst rulebook = $('RULEBOOK').first().json.rulebook;\nconst output = [];\nconst norm = c => String(c ?? \"\").replace(/\\s+/g, \" \").trim().toUpperCase();\nconst problem = (fileName, reason) => output.push({ json: { sourceFile: fileName, status: reason } });\n\n// ---------- 1. Read every answer, group the pages per document ----------\nconst docs = {}; // fileName -> list of parts\n$input.all().forEach((item, i) => {\n  const req = $('Build AI request').itemMatching(i).json;\n  const part = { req, answer: null, error: null };\n\n  if (item.json.error) {\n    part.error = `OpenAI error: ${item.json.error.message || JSON.stringify(item.json.error)}`;\n  } else if (item.json.status && item.json.status !== \"completed\") {\n    part.error = `Incomplete AI answer (${item.json.status})`;\n  } else {\n    const message = (item.json.output || []).find(o => o.type === \"message\");\n    const textPart = message && (message.content || []).find(c => c.type === \"output_text\");\n    try {\n      part.answer = JSON.parse(textPart.text);\n    } catch (e) {\n      part.error = \"Invalid or empty AI answer\";\n    }\n  }\n  (docs[req.fileName] = docs[req.fileName] || []).push(part);\n});\n\n// ---------- 2. Each document ----------\nfor (const [fileName, parts] of Object.entries(docs)) {\n  parts.sort((a, b) => a.req.part - b.req.part);\n  const first = parts[0].req;\n  const pageLabel = p => (p.req.parts > 1 ? `page ${p.req.part}: ` : \"\");\n\n  // Pages that failed are reported; the good pages still count\n  parts.filter(p => p.error).forEach(p => problem(fileName, `${pageLabel(p)}${p.error}`));\n  const good = parts.filter(p => p.answer);\n  if (good.length === 0) continue;\n\n  // Document-level fields: the first page that prints them\n  const pick = field => (good.find(p => p.answer[field] && p.answer[field] !== \"unknown\") || {}).answer?.[field] ?? null;\n  const supplierKey = first.supplierKey || pick(\"supplier\");\n  const supplier = rulebook.suppliers[supplierKey];\n  const docType = pick(\"docType\");\n  if (!supplier) { problem(fileName, \"Unknown supplier\"); continue; }\n  if (docType !== \"OC\" && docType !== \"DN\") { problem(fileName, \"Unknown document type\"); continue; }\n\n  const documentNumber = pick(\"documentNumber\");\n  const docPo = pick(\"poNumber\");\n  const docDate = pick(\"deliveryDate\");\n  const pattern = supplier.codePattern ? new RegExp(supplier.codePattern, \"g\") : null;\n  let lineCount = 0;\n\n  for (const p of good) {\n    const lines = p.answer.lines || [];\n    const checkable = pattern && !first.isScan && p.req.pageText;\n\n    // ---- Completeness check for this page (digital PDFs only) ----\n    let inText = new Set();\n    if (checkable) {\n      inText = new Set((p.req.pageText.match(pattern) || []).map(norm));\n      const inAnswer = new Set(lines.flatMap(l => [norm(l.supplierPartNo), norm(l.customerPartNo)]));\n      const missing = [...inText].filter(c => !inAnswer.has(c));\n      if (missing.length) {\n        const list = missing.slice(0, 10).join(\", \") + (missing.length > 10 ? ` (+${missing.length - 10})` : \"\");\n        problem(fileName, `${pageLabel(p)}${missing.length} lines of the document are missing from the reading: ${list}`);\n      }\n    }\n\n    for (const l of lines) {\n      // Was this code really printed? (catches invented lines)\n      let checkNote = \"\";\n      if (checkable && !inText.has(norm(l.supplierPartNo)) && !inText.has(norm(l.customerPartNo))) {\n        checkNote = `Code ${l.supplierPartNo || l.customerPartNo} does not appear in the document text`;\n      }\n      if (first.isScan && rulebook.ai.reviewScans) {\n        checkNote = \"Read from a scan – check visually\";\n      }\n\n      lineCount++;\n      output.push({\n        json: {\n          sourceFile: fileName,\n          supplier: supplierKey,\n          supplierName: supplier.name,\n          docType: docType,\n          documentNumber: documentNumber,\n          poNumber: l.poNumber || docPo,              // line PO wins (several orders per DN)\n          position: l.position,\n          customerPartNo: l.customerPartNo,\n          supplierPartNo: l.supplierPartNo,\n          quantity: l.quantity,\n          confirmedQuantity: l.confirmedQuantity,\n          unit: l.unit,\n          packSize: l.packSize,\n          unitPrice: l.unitPrice,\n          priceUnit: l.priceUnit,\n          lineTotal: l.lineTotal,\n          deliveryDate: l.deliveryDate || docDate,    // line date wins\n          palletNo: l.palletNo,\n          readBy: first.isScan ? \"AI (scan)\" : `AI (text, ${parts.length} ${parts.length > 1 ? \"pages read separately\" : \"request\"})`,\n          checkNote: checkNote,\n          status: \"OK\",\n        },\n      });\n    }\n  }\n  if (lineCount === 0) problem(fileName, \"AI found no lines\");\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1840,
+        160
+      ],
+      "id": "b1f2a1d7-fbc6-4db4-b9df-527fd037b3fe",
+      "name": "Read AI answer",
+      "notesInFlow": true,
+      "notes": "Checks in code: missing or invented lines"
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1968,
+        512
+      ],
+      "id": "2074554d-520a-4bc6-a7f7-d252e7a21ab1",
+      "name": "Join roads"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// SKIPPED FILES – files that were not read, and why.\n// They go to Review.xlsx, so every uploaded file is accounted for.\n// ============================================================\n\nreturn $input.all().map(item => ({\n  json: {\n    sourceFile: item.json.fileName,\n    status: item.json.fileKind === \"duplicate\"\n      ? \"Skipped: the same document was also uploaded as Excel (the Excel was read)\"\n      : \"Skipped: unknown file type\",\n  },\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1856,
+        800
+      ],
+      "id": "c8ac5730-607d-4b99-bb6b-20e369e4bdb4",
+      "name": "Skipped files"
+    },
+    {
+      "parameters": {
+        "content": "## 1. Intake and sorting\n",
+        "height": 288,
+        "width": 880,
+        "color": "#D6D6D6"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        432
+      ],
+      "id": "f78de72b-c754-438d-8182-e11ddb37ae28",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "## 2. Excel road\n",
+        "height": 288,
+        "width": 672,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        992,
+        432
+      ],
+      "id": "e2d82581-d65c-492a-b2ad-47153580edbc",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "content": "## 3. PDF road (AI)\n",
+        "height": 224,
+        "width": 1088,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        896,
+        96
+      ],
+      "id": "0b0554fc-4f49-4edf-a636-1346f52b789b",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "content": "## 4. Rules and checks\n",
+        "height": 480,
+        "width": 576,
+        "color": 2
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1776,
+        448
+      ],
+      "id": "def5f6cd-0093-4c0d-9369-35a5cdfd89a5",
+      "name": "Sticky Note3"
+    },
+    {
+      "parameters": {
+        "content": "## 5. Output\n",
+        "height": 592,
+        "width": 1520,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2528,
+        320
+      ],
+      "id": "f184b69a-e48c-4bfd-bd65-4cb93f9eb482",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "content": "\n## Supplier document reader → ERP import files\nReads order confirmations and delivery notes from many suppliers\n(Excel, digital PDF, scans; German, Czech, Polish/English) and writes\nthem into the company's ERP import templates.\n\n**How to run:** Execute workflow → upload files → download Result.zip\n(OC.xlsx, DN.xlsx, Review.xlsx).\n\n**Design**\n- RULEBOOK = all supplier knowledge in one place (rules, AI notes, code patterns)\n- The AI only copies what is printed; code does the maths\n- Long PDFs are read page by page\n- Code checks every page: no missing lines, no invented codes\n- Anything unverified goes to Review.xlsx for a human\n\n**Tested on fictional documents:** 73/73 OC and 425/425 DN lines correct\nacross repeated runs; AI cost ≈ $0.00008 per line.",
+        "height": 352,
+        "width": 704,
+        "color": "#FFFFFF"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "b0e71ff4-aba4-4711-a3fe-fc69facacde4",
+      "name": "Sticky Note5"
+    },
+    {
+      "parameters": {
+        "content": "## Glossary\n- **OC** – Order Confirmation: the supplier confirms what, how many, at what price and when\n- **DN** – Delivery Note: what was actually shipped\n- **PO** – Purchase Order number: the buyer's own order reference\n- **ERP** – the company's business system; it imports the OC/DN files\n- **UOM** – Unit of Measure (STK = pieces, L = litres)\n- **Pack size** – pieces per package (\"10 X 1 l\" = 10 bottles per box)\n- **Digital PDF** – has a text layer; **Scan** – only an image of the page\n- **RULEBOOK** – the one node that holds all supplier knowledge\n- **Code pattern** – what a product code looks like; used to check nothing was skipped\n- **Review.xlsx** – everything a person should look at, with the reason",
+        "height": 352,
+        "width": 704,
+        "color": "#F1EFEF"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        800
+      ],
+      "id": "cdf80309-e599-488f-a98a-b45c7e65d53a",
+      "name": "Sticky Note6"
+    },
+    {
+      "parameters": {
+        "content": "## Extending this\n\n**New supplier** → add one entry in RULEBOOK (identify words, document type keywords, rules). No new nodes.\n\n**New ERP format** → change the column list in OC rows / DN rows.\n\n**Different intake** → replace the Upload form with an email inbox or a shared folder. Everything after \"Split files\" stays the same.\n\n**Next document types** → invoices, price lists.\n\n**Same engine, new job** → match customer requests (RFQs) against an internal product catalogue.",
+        "height": 240,
+        "width": 704,
+        "color": "#D8E4DB"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        1168
+      ],
+      "id": "d632cb1f-335a-46ea-86f6-858582d94af5",
+      "name": "Sticky Note7"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Upload form": {
+      "main": [
+        [
+          {
+            "node": "RULEBOOK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RULEBOOK": {
+      "main": [
+        [
+          {
+            "node": "Split files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split files": {
+      "main": [
+        [
+          {
+            "node": "File type?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "File type?": {
+      "main": [
+        [
+          {
+            "node": "Extract PDF text",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extract Excel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skipped files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract PDF text": {
+      "main": [
+        [
+          {
+            "node": "Digital or scanned",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Excel": {
+      "main": [
+        [
+          {
+            "node": "Read Excel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Excel": {
+      "main": [
+        [
+          {
+            "node": "Join roads",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Apply rules": {
+      "main": [
+        [
+          {
+            "node": "OC rows",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "DN rows",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Review rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review rows": {
+      "main": [
+        [
+          {
+            "node": "Review file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DN rows": {
+      "main": [
+        [
+          {
+            "node": "DN file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OC rows": {
+      "main": [
+        [
+          {
+            "node": "OC file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect files": {
+      "main": [
+        [
+          {
+            "node": "Bundle files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zip": {
+      "main": [
+        [
+          {
+            "node": "Download result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review file": {
+      "main": [
+        [
+          {
+            "node": "Collect files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DN file": {
+      "main": [
+        [
+          {
+            "node": "Collect files",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "OC file": {
+      "main": [
+        [
+          {
+            "node": "Collect files",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Bundle files": {
+      "main": [
+        [
+          {
+            "node": "Zip",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Digital or scanned": {
+      "main": [
+        [
+          {
+            "node": "Build AI request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build AI request": {
+      "main": [
+        [
+          {
+            "node": "Ask OpenAI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask OpenAI": {
+      "main": [
+        [
+          {
+            "node": "Read AI answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Join roads": {
+      "main": [
+        [
+          {
+            "node": "Apply rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read AI answer": {
+      "main": [
+        [
+          {
+            "node": "Join roads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skipped files": {
+      "main": [
+        [
+          {
+            "node": "Join roads",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "988f5327-78d8-43fa-aa01-04ca60da48fe",
+  "meta": {
+    "instanceId": "f1a9f045c45537de31c79c67835c928f8d6bd84eb968f4da0fafc0e8faeb6d47"
+  },
+  "nodeGroups": [],
+  "id": "gJovw73xzY79WcPK",
+  "tags": []
+}
